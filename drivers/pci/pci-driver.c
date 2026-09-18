@@ -542,8 +542,16 @@ static void pci_device_shutdown(struct device *dev)
 {
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 	struct pci_driver *drv = pci_dev->driver;
+	int error;
 
-	pm_runtime_resume(dev);
+	/* The upstream Power Wrap domain never restored config or BAR access. */
+	if (mtk_pci_pwrap_resume_noirq_failed(pci_dev))
+		return;
+
+	error = pm_runtime_resume(dev);
+	if (error < 0 && mtk_pci_pwrap_is_managed(pci_dev) &&
+	    mtk_pci_pwrap_resume(pci_dev, false))
+		return;
 
 	if (drv && drv->shutdown)
 		drv->shutdown(pci_dev);
@@ -773,6 +781,9 @@ static void pci_pm_complete(struct device *dev)
 {
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 
+	if (mtk_pci_pwrap_resume_noirq_failed(pci_dev))
+		goto out;
+
 	pci_dev_complete_resume(pci_dev);
 	pm_generic_complete(dev);
 
@@ -792,6 +803,7 @@ static void pci_pm_complete(struct device *dev)
 			pm_request_resume(dev);
 	}
 
+out:
 	dev_pm_set_strict_midlayer(dev, false);
 }
 
@@ -801,6 +813,25 @@ static void pci_pm_complete(struct device *dev)
 #define pci_pm_complete	NULL
 
 #endif /* !CONFIG_PM_SLEEP */
+
+#if defined(CONFIG_SUSPEND) || defined(CONFIG_HIBERNATE_CALLBACKS)
+static int pci_pm_runtime_resume_for_system_sleep(struct pci_dev *pci_dev)
+{
+	struct device *dev = &pci_dev->dev;
+	int error;
+
+	if (mtk_pci_pwrap_resume_noirq_failed(pci_dev))
+		return -EIO;
+
+	error = pm_runtime_resume(dev);
+	if (error < 0 && mtk_pci_pwrap_is_managed(pci_dev))
+		return error;
+
+	/* Preserve the existing PCI PM behavior for unmanaged devices. */
+	pci_dev->state_saved = false;
+	return 0;
+}
+#endif
 
 #ifdef CONFIG_SUSPEND
 static void pcie_pme_root_status_cleanup(struct pci_dev *pci_dev)
@@ -820,8 +851,18 @@ static int pci_pm_suspend(struct device *dev)
 {
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+	bool pwrap_managed;
+	int error;
 
 	pci_dev->skip_bus_pm = false;
+	pwrap_managed = mtk_pci_pwrap_is_managed(pci_dev);
+
+	/* Power Wrap must restore config access before the first PCI access. */
+	if (pwrap_managed) {
+		error = pci_pm_runtime_resume_for_system_sleep(pci_dev);
+		if (error)
+			return error;
+	}
 
 	/*
 	 * Disabling PTM allows some systems, e.g., Intel mobile chips
@@ -851,15 +892,17 @@ static int pci_pm_suspend(struct device *dev)
 	 * better to resume the device from runtime suspend here.
 	 */
 	if (!dev_pm_smart_suspend(dev) || pci_dev_need_resume(pci_dev)) {
-		pm_runtime_resume(dev);
-		pci_dev->state_saved = false;
+		if (!pwrap_managed) {
+			error = pci_pm_runtime_resume_for_system_sleep(pci_dev);
+			if (error)
+				return error;
+		}
 	} else {
 		pci_dev_adjust_pme(pci_dev);
 	}
 
 	if (pm->suspend) {
 		pci_power_t prev = pci_dev->current_state;
-		int error;
 
 		error = pm->suspend(dev);
 		suspend_report_result(dev, pm->suspend, error);
@@ -979,6 +1022,16 @@ Fixup:
 	if (device_can_wakeup(dev) && !device_may_wakeup(dev))
 		dev->power.may_skip_resume = false;
 
+#ifdef CONFIG_MTK_POWER_WRAP
+	/* Gate only after PCI configuration-space accesses are complete. */
+	if (!(pci_dev->skip_bus_pm && pm_suspend_no_platform())) {
+		int error = mtk_pci_pwrap_suspend(pci_dev, true);
+
+		if (error)
+			return error;
+	}
+#endif
+
 	return 0;
 }
 
@@ -989,6 +1042,9 @@ static int pci_pm_resume_noirq(struct device *dev)
 	pci_power_t prev_state = pci_dev->current_state;
 	bool skip_bus_pm = pci_dev->skip_bus_pm;
 
+	if (mtk_pci_pwrap_resume_noirq_failed(pci_dev))
+		return -EIO;
+
 	if (dev_pm_skip_resume(dev))
 		return 0;
 
@@ -998,8 +1054,20 @@ static int pci_pm_resume_noirq(struct device *dev)
 	 * configuration here and attempting to put them into D0 again is
 	 * pointless, so avoid doing that.
 	 */
-	if (!(skip_bus_pm && pm_suspend_no_platform()))
+	if (!(skip_bus_pm && pm_suspend_no_platform())) {
+#ifdef CONFIG_MTK_POWER_WRAP
+		/* Restore segment config access before touching the device. */
+		int error = mtk_pci_pwrap_resume(pci_dev, true);
+
+		if (error) {
+			/* The skipped noirq work cannot be replayed later. */
+			mtk_pci_pwrap_mark_resume_noirq_failed(pci_dev);
+			return error;
+		}
+#endif
+
 		pci_pm_default_resume_early(pci_dev);
+	}
 
 	pci_fixup_device(pci_fixup_resume_early, pci_dev);
 	pcie_pme_root_status_cleanup(pci_dev);
@@ -1020,6 +1088,8 @@ static int pci_pm_resume_early(struct device *dev)
 {
 	if (dev_pm_skip_resume(dev))
 		return 0;
+	if (mtk_pci_pwrap_resume_noirq_failed(to_pci_dev(dev)))
+		return -EIO;
 
 	return pm_generic_resume_early(dev);
 }
@@ -1028,6 +1098,9 @@ static int pci_pm_resume(struct device *dev)
 {
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+
+	if (mtk_pci_pwrap_resume_noirq_failed(pci_dev))
+		return -EIO;
 
 	/*
 	 * This is necessary for the suspend error path in which resume is
@@ -1089,8 +1162,13 @@ static int pci_pm_freeze(struct device *dev)
 	 * so it is better to ensure that the state saved in the image will be
 	 * always consistent with that.
 	 */
-	pm_runtime_resume(dev);
-	pci_dev->state_saved = false;
+	{
+		int error;
+
+		error = pci_pm_runtime_resume_for_system_sleep(pci_dev);
+		if (error)
+			return error;
+	}
 
 	if (pm->freeze) {
 		int error;
@@ -1189,8 +1267,11 @@ static int pci_pm_poweroff(struct device *dev)
 
 	/* The reason to do that is the same as in pci_pm_suspend(). */
 	if (!dev_pm_smart_suspend(dev) || pci_dev_need_resume(pci_dev)) {
-		pm_runtime_resume(dev);
-		pci_dev->state_saved = false;
+		int error;
+
+		error = pci_pm_runtime_resume_for_system_sleep(pci_dev);
+		if (error)
+			return error;
 	} else {
 		pci_dev_adjust_pme(pci_dev);
 	}
@@ -1371,6 +1452,19 @@ static int pci_pm_runtime_suspend(struct device *dev)
 		pci_finish_runtime_suspend(pci_dev);
 	}
 
+#ifdef CONFIG_MTK_POWER_WRAP
+	/* Gate the segment only after PCI config-space accesses are complete. */
+	if (pci_dev->current_state != PCI_D0 &&
+	    pci_dev->current_state != PCI_UNKNOWN) {
+		/*
+		 * The driver and PCI device are already suspended.  On failure,
+		 * leave the segment powered instead of returning with runtime PM
+		 * state inconsistent with the device state.
+		 */
+		mtk_pci_pwrap_suspend(pci_dev, false);
+	}
+#endif
+
 	return 0;
 }
 
@@ -1381,11 +1475,20 @@ static int pci_pm_runtime_resume(struct device *dev)
 	pci_power_t prev_state = pci_dev->current_state;
 	int error = 0;
 
+	if (mtk_pci_pwrap_resume_noirq_failed(pci_dev))
+		return -EIO;
+
 	/*
 	 * Restoring config space is necessary even if the device is not bound
 	 * to a driver because although we left it in D0, it may have gone to
 	 * D3cold when the bridge above it runtime suspended.
 	 */
+#ifdef CONFIG_MTK_POWER_WRAP
+	error = mtk_pci_pwrap_resume(pci_dev, false);
+	if (error)
+		return error;
+#endif
+
 	pci_pm_default_resume_early(pci_dev);
 	pci_resume_ptm(pci_dev);
 
