@@ -265,7 +265,53 @@ void pci_disable_enabled_device(struct pci_dev *dev);
 int pci_finish_runtime_suspend(struct pci_dev *dev);
 void pcie_clear_device_status(struct pci_dev *dev);
 void pcie_clear_root_pme_status(struct pci_dev *dev);
+struct mtk_pci_pwrap_rescan_context {
+	struct pci_dev **anchors;
+	unsigned int anchor_count;
+	unsigned int active_count;
+};
+
 bool pci_check_pme_status(struct pci_dev *dev);
+#ifdef CONFIG_MTK_POWER_WRAP
+void mtk_pci_pwrap_init(struct pci_dev *dev);
+bool mtk_pci_pwrap_is_managed(struct pci_dev *dev);
+int mtk_pci_pwrap_suspend(struct pci_dev *dev, bool system_transition);
+int mtk_pci_pwrap_resume(struct pci_dev *dev, bool system_transition);
+bool mtk_pci_pwrap_resume_noirq_failed(struct pci_dev *dev);
+void mtk_pci_pwrap_mark_resume_noirq_failed(struct pci_dev *dev);
+int mtk_pci_pwrap_rescan_prepare(struct pci_bus *bus,
+				 struct mtk_pci_pwrap_rescan_context *context);
+void mtk_pci_pwrap_rescan_done(struct mtk_pci_pwrap_rescan_context *context);
+#else
+static inline bool mtk_pci_pwrap_is_managed(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int
+mtk_pci_pwrap_resume(struct pci_dev *dev, bool system_transition)
+{
+	return 0;
+}
+
+static inline bool mtk_pci_pwrap_resume_noirq_failed(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline void
+mtk_pci_pwrap_mark_resume_noirq_failed(struct pci_dev *dev) { }
+
+static inline int
+mtk_pci_pwrap_rescan_prepare(struct pci_bus *bus,
+			     struct mtk_pci_pwrap_rescan_context *context)
+{
+	return 0;
+}
+
+static inline void
+mtk_pci_pwrap_rescan_done(struct mtk_pci_pwrap_rescan_context *context) { }
+#endif
 void pci_pme_wakeup_bus(struct pci_bus *bus);
 void pci_pme_restore(struct pci_dev *dev);
 bool pci_dev_need_resume(struct pci_dev *dev);

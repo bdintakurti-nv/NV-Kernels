@@ -460,17 +460,25 @@ static DEVICE_ATTR_RW(msi_bus);
 
 static ssize_t rescan_store(const struct bus_type *bus, const char *buf, size_t count)
 {
+	struct mtk_pci_pwrap_rescan_context context = {};
 	unsigned long val;
 	struct pci_bus *b = NULL;
+	int ret;
 
 	if (kstrtoul(buf, 0, &val) < 0)
 		return -EINVAL;
 
 	if (val) {
 		pci_lock_rescan_remove();
-		while ((b = pci_find_next_bus(b)) != NULL)
-			pci_rescan_bus(b);
+		ret = mtk_pci_pwrap_rescan_prepare(NULL, &context);
+		if (!ret) {
+			while ((b = pci_find_next_bus(b)) != NULL)
+				pci_rescan_bus(b);
+		}
+		mtk_pci_pwrap_rescan_done(&context);
 		pci_unlock_rescan_remove();
+		if (ret)
+			return ret;
 	}
 	return count;
 }
@@ -494,16 +502,23 @@ static ssize_t dev_rescan_store(struct device *dev,
 				struct device_attribute *attr, const char *buf,
 				size_t count)
 {
+	struct mtk_pci_pwrap_rescan_context context = {};
 	unsigned long val;
 	struct pci_dev *pdev = to_pci_dev(dev);
+	int ret;
 
 	if (kstrtoul(buf, 0, &val) < 0)
 		return -EINVAL;
 
 	if (val) {
 		pci_lock_rescan_remove();
-		pci_rescan_bus(pdev->bus);
+		ret = mtk_pci_pwrap_rescan_prepare(pdev->bus, &context);
+		if (!ret)
+			pci_rescan_bus(pdev->bus);
+		mtk_pci_pwrap_rescan_done(&context);
 		pci_unlock_rescan_remove();
+		if (ret)
+			return ret;
 	}
 	return count;
 }
@@ -529,19 +544,27 @@ static ssize_t bus_rescan_store(struct device *dev,
 				struct device_attribute *attr,
 				const char *buf, size_t count)
 {
+	struct mtk_pci_pwrap_rescan_context context = {};
 	unsigned long val;
 	struct pci_bus *bus = to_pci_bus(dev);
+	int ret;
 
 	if (kstrtoul(buf, 0, &val) < 0)
 		return -EINVAL;
 
 	if (val) {
 		pci_lock_rescan_remove();
-		if (!pci_is_root_bus(bus) && list_empty(&bus->devices))
-			pci_rescan_bus_bridge_resize(bus->self);
-		else
-			pci_rescan_bus(bus);
+		ret = mtk_pci_pwrap_rescan_prepare(bus, &context);
+		if (!ret) {
+			if (!pci_is_root_bus(bus) && list_empty(&bus->devices))
+				pci_rescan_bus_bridge_resize(bus->self);
+			else
+				pci_rescan_bus(bus);
+		}
+		mtk_pci_pwrap_rescan_done(&context);
 		pci_unlock_rescan_remove();
+		if (ret)
+			return ret;
 	}
 	return count;
 }
